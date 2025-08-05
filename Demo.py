@@ -7,6 +7,8 @@ from langchain.docstore.document import Document
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_huggingface import HuggingFacePipeline
+from langchain.docstore import InMemoryDocstore
+import faiss
 
 # ==============================
 # CONFIG
@@ -87,9 +89,16 @@ if not os.path.exists(INDEX_PATH):
                 embeddings = normalize(embeddings)
 
                 if db is None:
-                    db = FAISS.from_embeddings(chunks, embeddings)
-                else:
-                    db.add_texts(chunks, embeddings)
+                    # Create FAISS index manually
+                    dimension = embeddings.shape[1]
+                    index = faiss.IndexFlatL2(dimension)
+                    db = FAISS(
+                        embedding_function=None,
+                        index=index,
+                        docstore=InMemoryDocstore({}),
+                        index_to_docstore_id={}
+                    )
+                db.add_texts(chunks, embeddings)
 
     db.save_local(INDEX_PATH)
 else:
