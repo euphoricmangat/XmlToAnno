@@ -3,11 +3,11 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, pipeline
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.docstore.document import Document
-from langchain_community.vectorstores import FAISS
+from langchain.docstore import InMemoryDocstore
 from langchain.chains import RetrievalQA
 from langchain_huggingface import HuggingFacePipeline
-from langchain.docstore import InMemoryDocstore
+from langchain_community.vectorstores import FAISS
+from langchain.embeddings.base import Embeddings
 import faiss
 
 # ==============================
@@ -56,6 +56,19 @@ def embed_in_batches(embedder, texts, batch_size):
     return np.vstack(all_embeddings)
 
 # ==============================
+# LangChain Wrapper for Custom Embedder
+# ==============================
+class LangchainEmbedWrapper(Embeddings):
+    def __init__(self, embedder):
+        self.embedder = embedder
+
+    def embed_documents(self, texts):
+        return self.embedder.embed(texts).tolist()
+
+    def embed_query(self, text):
+        return self.embedder.embed([text])[0].tolist()
+
+# ==============================
 # STEP 1: Load Local LLM (CPU)
 # ==============================
 print("Loading local Hugging Face model on CPU...")
@@ -71,9 +84,13 @@ llm = HuggingFacePipeline(pipeline=pipe)
 if not os.path.exists(INDEX_PATH):
     print("Creating new FAISS index...")
     embedder = NLIEmbedder(EMBED_MODEL_PATH)
+    lc_embeddings = LangchainEmbedWrapper(embedder)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
     db = None
+    index_to_docstore_id = {}
+    docstore_dict = {}
+
     for root, dirs, files in os.walk(CODEBASE_PATH):
         for file in files:
             if file.endswith((".py", ".java", ".js", ".ts", ".html", ".css", ".md")):
@@ -93,17 +110,21 @@ if not os.path.exists(INDEX_PATH):
                     dimension = embeddings.shape[1]
                     index = faiss.IndexFlatL2(dimension)
                     db = FAISS(
-                        embedding_function=None,
+                        embedding_function=lc_embeddings,
                         index=index,
                         docstore=InMemoryDocstore({}),
                         index_to_docstore_id={}
                     )
+
+                # Add chunks and embeddings to index
                 db.add_texts(chunks, embeddings)
 
     db.save_local(INDEX_PATH)
 else:
     print("Loading existing FAISS index...")
-    db = FAISS.load_local(INDEX_PATH, embeddings=None, allow_dangerous_deserialization=True)
+    embedder = NLIEmbedder(EMBED_MODEL_PATH)
+    lc_embeddings = LangchainEmbedWrapper(embedder)
+    db = FAISS.load_local(INDEX_PATH, embeddings=lc_embeddings, allow_dangerous_deserialization=True)
 
 retriever = db.as_retriever(search_kwargs={"k": TOP_K})
 
