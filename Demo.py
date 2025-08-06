@@ -95,15 +95,25 @@ if not os.path.exists(INDEX_PATH):
         for file in files:
             if file.endswith((".py", ".java", ".js", ".ts", ".html", ".css", ".md")):
                 file_path = os.path.join(root, file)
+                print(f"Processing: {file_path}")
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
+                # Split into chunks and remove empty ones
                 chunks = text_splitter.split_text(content)
+                chunks = [c for c in chunks if c.strip()]
                 if not chunks:
+                    print(f"Skipped (empty): {file_path}")
                     continue
 
+                # Embed and normalize
                 embeddings = embed_in_batches(embedder, chunks, BATCH_SIZE)
                 embeddings = normalize(embeddings)
+
+                # Validate alignment
+                if len(chunks) != embeddings.shape[0]:
+                    print(f"⚠ Skipped file due to mismatch: {file_path} (chunks={len(chunks)} embeddings={embeddings.shape[0]})")
+                    continue
 
                 if index is None:
                     dimension = embeddings.shape[1]
@@ -111,10 +121,14 @@ if not os.path.exists(INDEX_PATH):
 
                 # Add chunks manually with embeddings
                 for i, chunk in enumerate(chunks):
+                    if not chunk.strip():
+                        continue
                     doc_id = str(len(docstore._dict))
                     index.add(np.array([embeddings[i]]).astype("float32"))
                     docstore._dict[doc_id] = chunk
                     index_to_docstore_id[len(index_to_docstore_id)] = doc_id
+
+                print(f"Added {len(chunks)} chunks from {file_path}")
 
     db = FAISS(
         embedding_function=lc_embeddings,
@@ -124,6 +138,7 @@ if not os.path.exists(INDEX_PATH):
     )
 
     db.save_local(INDEX_PATH)
+    print(f"✅ FAISS index created and saved at {INDEX_PATH}")
 else:
     print("Loading existing FAISS index...")
     embedder = NLIEmbedder(EMBED_MODEL_PATH)
