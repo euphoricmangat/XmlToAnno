@@ -36,4 +36,114 @@ class NLIEmbedder:
         with torch.no_grad():
             outputs = self.model(**inputs)
         token_embeddings = outputs.last_hidden_state
-        attention_mask = inputs['
+        attention_mask = inputs['attention_mask']
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        return mean_embeddings.cpu().numpy()
+
+def normalize(vectors):
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / norms
+
+def embed_in_batches(embedder, texts, batch_size):
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        batch_embeddings = embedder.embed(batch)
+        all_embeddings.append(batch_embeddings)
+    return np.vstack(all_embeddings)
+
+# ==============================
+# LangChain Wrapper for Custom Embedder
+# ==============================
+class LangchainEmbedWrapper(Embeddings):
+    def __init__(self, embedder):
+        self.embedder = embedder
+
+    def embed_documents(self, texts):
+        return self.embedder.embed(texts).tolist()
+
+    def embed_query(self, text):
+        return self.embedder.embed([text])[0].tolist()
+
+# ==============================
+# STEP 1: Load Local LLM (CPU)
+# ==============================
+print("Loading local Hugging Face model on CPU...")
+tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_PATH)
+model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_PATH, torch_dtype="auto", device_map="cpu")
+
+pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512, temperature=0.2, do_sample=True)
+llm = HuggingFacePipeline(pipeline=pipe)
+
+# ==============================
+# STEP 2: Build or Load FAISS Index Incrementally
+# ==============================
+if not os.path.exists(INDEX_PATH):
+    print("Creating new FAISS index...")
+    embedder = NLIEmbedder(EMBED_MODEL_PATH)
+    lc_embeddings = LangchainEmbedWrapper(embedder)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+
+    index = None
+    docstore = InMemoryDocstore({})
+    index_to_docstore_id = {}
+
+    for root, dirs, files in os.walk(CODEBASE_PATH):
+        for file in files:
+            if file.endswith((".py", ".java", ".js", ".ts", ".html", ".css", ".md")):
+                file_path = os.path.join(root, file)
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+                chunks = text_splitter.split_text(content)
+                if not chunks:
+                    continue
+
+                embeddings = embed_in_batches(embedder, chunks, BATCH_SIZE)
+                embeddings = normalize(embeddings)
+
+                if index is None:
+                    dimension = embeddings.shape[1]
+                    index = faiss.IndexFlatL2(dimension)
+
+                # Add chunks manually with embeddings
+                for i, chunk in enumerate(chunks):
+                    doc_id = str(len(docstore._dict))
+                    index.add(np.array([embeddings[i]]).astype("float32"))
+                    docstore._dict[doc_id] = chunk
+                    index_to_docstore_id[len(index_to_docstore_id)] = doc_id
+
+    db = FAISS(
+        embedding_function=lc_embeddings,
+        index=index,
+        docstore=docstore,
+        index_to_docstore_id=index_to_docstore_id
+    )
+
+    db.save_local(INDEX_PATH)
+else:
+    print("Loading existing FAISS index...")
+    embedder = NLIEmbedder(EMBED_MODEL_PATH)
+    lc_embeddings = LangchainEmbedWrapper(embedder)
+    db = FAISS.load_local(INDEX_PATH, embeddings=lc_embeddings, allow_dangerous_deserialization=True)
+
+retriever = db.as_retriever(search_kwargs={"k": TOP_K})
+
+# ==============================
+# STEP 3: Create QA Chain
+# ==============================
+qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+
+# ==============================
+# STEP 4: Interactive Q&A
+# ==============================
+print("\n✅ Ready! Ask questions about your codebase (type 'exit' to quit):")
+while True:
+    query = input("\n> ")
+    if query.lower() in ["exit", "quit"]:
+        break
+    answer = qa.run(query)
+    print(f"\nAnswer:\n{answer}\n")
